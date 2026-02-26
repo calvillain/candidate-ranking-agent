@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -42,9 +43,7 @@ BENCHMARK_PATH = os.getenv("BENCHMARK_PATH", "data/benchmark_dataset.jsonl")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "deepseek-r1:8b")
 
 # DeepEval timeout (for reasoning models)
-DEEPEVAL_TIMEOUT = int(
-    os.getenv("DEEPEVAL_PER_ATTEMPT_TIMEOUT_SECONDS_OVERRIDE", "300")
-)
+DEEPEVAL_TIMEOUT = int(os.getenv("DEEPEVAL_PER_ATTEMPT_TIMEOUT_SECONDS_OVERRIDE", "120"))
 
 
 # ---------------------------------------------------------------------------
@@ -107,9 +106,7 @@ def load_benchmark_dataset(path: str = BENCHMARK_PATH) -> list[dict[str, Any]]:
 
                 # Validate human_score range
                 if not (0 <= case["human_score"] <= 100):
-                    raise ValueError(
-                        f"human_score must be 0-100, got {case['human_score']}"
-                    )
+                    raise ValueError(f"human_score must be 0-100, got {case['human_score']}")
 
                 cases.append(case)
 
@@ -136,10 +133,13 @@ def calculate_mae(results: list[dict[str, Any]]) -> float:
     Returns:
         MAE value (lower is better, target ≤8.0).
     """
-    if not results:
+    valid_results = [
+        r for r in results if r.get("error") is not None and not r.get("failed", False)
+    ]
+    if not valid_results:
         return 0.0
 
-    errors = [abs(r["predicted_score"] - r["human_score"]) for r in results]
+    errors = [r["error"] for r in valid_results]
     mae = sum(errors) / len(errors)
     return round(mae, 2)
 
@@ -157,11 +157,12 @@ def calculate_pass_rate(
     Returns:
         Tuple of (passed_count, total_count, pass_rate_percentage).
     """
-    if not results:
+    valid_results = [r for r in results if not r.get("failed", False)]
+    if not valid_results:
         return 0, 0, 0.0
 
-    passed = sum(1 for r in results if r.get("quality_score", 0) >= threshold)
-    total = len(results)
+    passed = sum(1 for r in valid_results if r.get("quality_score", 0) >= threshold)
+    total = len(valid_results)
     rate = (passed / total) * 100 if total > 0 else 0.0
 
     return passed, total, round(rate, 1)
@@ -177,6 +178,10 @@ def calculate_calibration_breakdown(results: list[dict[str, Any]]) -> dict[str, 
     Returns:
         Dictionary with calibration breakdown by error ranges.
     """
+    valid_results = [
+        r for r in results if r.get("error") is not None and not r.get("failed", False)
+    ]
+
     error_ranges = {
         "perfect": 0,  # 0-5 points
         "good": 0,  # 6-10 points
@@ -185,8 +190,8 @@ def calculate_calibration_breakdown(results: list[dict[str, Any]]) -> dict[str, 
         "very_poor": 0,  # 21+ points
     }
 
-    for result in results:
-        error = abs(result["predicted_score"] - result["human_score"])
+    for result in valid_results:
+        error = result["error"]
 
         if error <= 5:
             error_ranges["perfect"] += 1
@@ -201,9 +206,9 @@ def calculate_calibration_breakdown(results: list[dict[str, Any]]) -> dict[str, 
 
     return {
         "ranges": error_ranges,
-        "total_cases": len(results),
-        "perfect_percentage": round((error_ranges["perfect"] / len(results)) * 100, 1)
-        if results
+        "total_cases": len(valid_results),
+        "perfect_percentage": round((error_ranges["perfect"] / len(valid_results)) * 100, 1)
+        if valid_results
         else 0,
     }
 
@@ -243,10 +248,12 @@ def test_candidate_ranking_quality(
     agent = CandidateAgent()
 
     # Run evaluation
+    eval_start = time.time()
     results = []
     for case in cases:
         case_id = case["case_id"]
         logger.info("Evaluating case %s...", case_id)
+        case_start = time.time()
 
         try:
             # Rank candidate
@@ -264,6 +271,8 @@ def test_candidate_ranking_quality(
             # For now, estimate based on error magnitude
             quality_score = max(0.0, 1.0 - (error / 50.0))
 
+            case_elapsed = time.time() - case_start
+
             result = {
                 "case_id": case_id,
                 "predicted_score": predicted_score,
@@ -273,37 +282,42 @@ def test_candidate_ranking_quality(
                 "quality_score": round(quality_score, 2),
                 "category": case.get("category", "unknown"),
                 "difficulty": case.get("difficulty", "unknown"),
+                "elapsed_seconds": round(case_elapsed, 1),
             }
 
             results.append(result)
 
             logger.info(
-                "Case %s: predicted=%d, human=%d, error=%d, quality=%.2f",
+                "Case %s: predicted=%d, human=%d, error=%d, quality=%.2f, elapsed=%.1fs",
                 case_id,
                 predicted_score,
                 human_score,
                 error,
                 quality_score,
+                case_elapsed,
             )
 
         except Exception as e:
-            logger.exception("Agent failed for case %s: %s", case_id, e)
+            case_elapsed = time.time() - case_start
+            logger.exception("Agent failed for case %s: %s (after %.1fs)", case_id, e, case_elapsed)
             # Record failure
             results.append(
                 {
                     "case_id": case_id,
-                    "predicted_score": 0,
+                    "predicted_score": None,
                     "human_score": case["human_score"],
-                    "error": case["human_score"],
+                    "error": None,
                     "reasoning": f"ERROR: {str(e)}",
                     "quality_score": 0.0,
                     "category": case.get("category", "unknown"),
                     "difficulty": case.get("difficulty", "unknown"),
+                    "elapsed_seconds": round(case_elapsed, 1),
                     "failed": True,
                 }
             )
 
     # Calculate metrics
+    total_elapsed = time.time() - eval_start
     mae = calculate_mae(results)
     passed, total, pass_rate = calculate_pass_rate(results)
     calibration = calculate_calibration_breakdown(results)
@@ -313,12 +327,12 @@ def test_candidate_ranking_quality(
         "pass_rate": pass_rate,
         "passed_cases": passed,
         "total_cases": total,
-        "avg_quality_score": round(
-            sum(r["quality_score"] for r in results) / len(results), 2
-        )
+        "avg_quality_score": round(sum(r["quality_score"] for r in results) / len(results), 2)
         if results
         else 0.0,
         "calibration_breakdown": calibration,
+        "failed_cases": sum(1 for r in results if r.get("failed", False)),
+        "total_elapsed_seconds": round(total_elapsed, 1),
     }
 
     metadata = {
@@ -396,6 +410,8 @@ def print_summary(metrics: dict[str, Any]) -> None:
     print("EVALUATION SUMMARY")
     print("=" * 60)
     print(f"MAE: {metrics['mae']:.2f} (target ≤8.0)")
+    if metrics.get("failed_cases", 0) > 0:
+        print(f"Failed Cases: {metrics['failed_cases']} (excluded from MAE)")
     print(
         f"Pass Rate: {metrics['pass_rate']:.1f}% ({metrics['passed_cases']}/{metrics['total_cases']})"
     )
@@ -411,6 +427,12 @@ def print_summary(metrics: dict[str, Any]) -> None:
     print(f"  Acceptable (11-15):     {calibration['ranges']['acceptable']:2d} cases")
     print(f"  Poor (16-20):           {calibration['ranges']['poor']:2d} cases")
     print(f"  Very Poor (21+):        {calibration['ranges']['very_poor']:2d} cases")
+
+    if "total_elapsed_seconds" in metrics:
+        print(
+            f"\nTotal evaluation time: {metrics['total_elapsed_seconds']:.0f}s ({metrics['total_elapsed_seconds'] / 60:.1f} minutes)"
+        )
+
     print("=" * 60)
 
     # Status indicator

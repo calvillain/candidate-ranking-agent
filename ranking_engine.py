@@ -10,9 +10,12 @@ Default model: DeepSeek-R1 8B (MAE 6.4, achieves target ≤8.0).
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import re
 import sys
+import time
 from dotenv import load_dotenv
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_ollama import ChatOllama
@@ -82,12 +85,17 @@ RANKING_USER_TEMPLATE = """Job description:
 {job_description}
 ---
 
-Candidate profile:
+Candidate profile (structured):
 - Skills: {skills}
 - Years of experience: {years_of_experience}
 - Past titles: {past_titles}
 
-Think step by step about how well this candidate fits the role (what requirements does the job have? which ones match? which ones are missing?), then output only the JSON object with keys: fit_score (0-100) and reasoning."""
+Full resume text:
+---
+{resume_text}
+---
+
+Think step by step about how well this candidate fits the role. Check BOTH the structured profile AND the full resume for matching skills. What requirements does the job have? Which ones match? Which ones are missing? Then output only the JSON object with keys: fit_score (0-100) and reasoning."""
 
 # ---------------------------------------------------------------------------
 # LLM client with structured output
@@ -100,7 +108,7 @@ def _get_llm() -> ChatOllama:
         base_url=OLLAMA_BASE_URL,
         model=OLLAMA_MODEL,
         temperature=0.1,
-        timeout=300,  # 5 minute timeout for reasoning models
+        timeout=120,  # 2 minute timeout — most successful calls complete in <90s
     ).with_structured_output(CandidateProfile)
 
 
@@ -110,8 +118,53 @@ def _get_ranking_llm() -> ChatOllama:
         base_url=OLLAMA_BASE_URL,
         model=OLLAMA_MODEL,
         temperature=0.2,
-        timeout=300,  # 5 minute timeout for reasoning models
+        timeout=120,  # 2 minute timeout — most successful calls complete in <90s
     ).with_structured_output(RankingResult)
+
+
+# ---------------------------------------------------------------------------
+# Fallback JSON parser for DeepSeek-R1 thinking tokens
+# ---------------------------------------------------------------------------
+
+
+def _extract_json_from_llm_output(raw_text: str) -> dict:
+    """
+    Extract JSON object from LLM output that may contain thinking tokens or markdown.
+
+    Handles DeepSeek-R1's tendency to output <think>...</think> blocks before JSON.
+    Also strips markdown code fences and extracts first valid JSON object.
+
+    Args:
+        raw_text: Raw LLM response text (potentially with thinking tokens or markdown).
+
+    Returns:
+        Parsed JSON object as dict.
+
+    Raises:
+        ValueError: If no valid JSON object can be extracted.
+    """
+    # Strip <think>...</think> blocks (with DOTALL to handle multiline)
+    cleaned = re.sub(r"<think>.*?</think>", "", raw_text, flags=re.DOTALL | re.IGNORECASE)
+
+    # Strip markdown code fences (```json ... ``` or ``` ... ```)
+    cleaned = re.sub(r"```(?:json)?\s*", "", cleaned)
+    cleaned = re.sub(r"```\s*$", "", cleaned)
+
+    # Find first { and last } to extract JSON object
+    first_brace = cleaned.find("{")
+    last_brace = cleaned.rfind("}")
+
+    if first_brace == -1 or last_brace == -1 or first_brace >= last_brace:
+        raise ValueError(f"No valid JSON object found in LLM output (length={len(raw_text)})")
+
+    json_str = cleaned[first_brace : last_brace + 1]
+
+    try:
+        parsed = json.loads(json_str)
+        logger.debug("Successfully extracted JSON via fallback parser")
+        return parsed
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Failed to parse extracted JSON: {e}")
 
 
 @retry(
@@ -163,10 +216,33 @@ def extract_candidate_profile(raw_resume_text: str) -> CandidateProfile:
 
     logger.info("Calling LLM to extract candidate profile (model=%s).", OLLAMA_MODEL)
     try:
+        start_time = time.time()
         result: CandidateProfile = chain.invoke({"resume_text": raw_resume_text})
+        elapsed = time.time() - start_time
+        logger.info("Extraction LLM call completed in %.1fs (model=%s).", elapsed, OLLAMA_MODEL)
     except Exception as e:
-        logger.exception("LLM invocation failed: %s", e)
-        raise
+        # Attempt fallback: call LLM WITHOUT structured output, then parse manually
+        logger.warning("Structured extraction failed (%s), attempting fallback parse...", e)
+        try:
+            start_time_fallback = time.time()
+            fallback_llm = ChatOllama(
+                base_url=OLLAMA_BASE_URL,
+                model=OLLAMA_MODEL,
+                temperature=0.1,
+                timeout=60,  # Shorter fallback timeout — best-effort recovery
+            )
+            fallback_chain = prompt | fallback_llm
+            raw_response = fallback_chain.invoke({"resume_text": raw_resume_text})
+            raw_text = (
+                raw_response.content if hasattr(raw_response, "content") else str(raw_response)
+            )
+            parsed = _extract_json_from_llm_output(raw_text)
+            result = CandidateProfile(**parsed)
+            elapsed = time.time() - start_time_fallback
+            logger.info("Fallback extraction succeeded in %.1fs", elapsed)
+        except Exception as fallback_error:
+            logger.exception("Both structured and fallback extraction failed: %s", fallback_error)
+            raise fallback_error from e  # Chain exceptions for debugging
 
     if not isinstance(result, CandidateProfile):
         raise ValueError(f"Expected CandidateProfile, got {type(result)}")
@@ -203,7 +279,7 @@ Think through the analysis, then output ONLY the JSON object.
 
 Analysis steps:
 1. List key JD requirements (skills, experience, seniority)
-2. Match each requirement against the candidate's actual skills and experience
+2. Match each requirement against the candidate's skills, experience, AND full resume text — the resume contains details not in the skills list
 3. Only count gaps for skills NOT present in the candidate profile — do NOT invent gaps
 4. Accept equivalent skills: "incident response" = "incident management", "led outages" implies "on-call experience"
 5. Apply calibration rules below
@@ -218,7 +294,7 @@ Calibration rules (apply consistently):
 Perfect match rule (IMPORTANT — apply carefully):
 - If candidate has ALL required skills listed in JD + meets experience level → score 85-95
 - Only penalize for skills explicitly required in JD that are genuinely absent from the profile
-- Do NOT invent gaps — if the resume says they have a skill, they have it
+- Do NOT invent gaps — check the FULL RESUME TEXT, not just the skills list. If the resume mentions a skill or experience anywhere, the candidate HAS it
 - Accept synonyms and implied competencies (e.g., "SRE principles, SLIs, SLOs" implies on-call and incident management experience)
 - Nice-to-have gaps → reduce by 5 max
 - Verify: before scoring below 85, list which SPECIFIC required skills are truly missing
@@ -296,21 +372,53 @@ def rank_candidate_from_profile(
 
     logger.info("Calling LLM for ranking (model=%s).", OLLAMA_MODEL)
     try:
+        start_time = time.time()
         result: RankingResult = chain.invoke(
             {
                 "job_description": job_description_raw.strip(),
-                "skills": ", ".join(profile.skills)
-                if profile.skills
-                else "None listed",
+                "skills": ", ".join(s for s in profile.skills if s.strip()) or "None listed",
                 "years_of_experience": profile.years_of_experience,
                 "past_titles": ", ".join(profile.past_titles)
                 if profile.past_titles
                 else "None listed",
+                "resume_text": profile.raw_resume_text or "Not available",
             }
         )
+        elapsed = time.time() - start_time
+        logger.info("Ranking LLM call completed in %.1fs (model=%s).", elapsed, OLLAMA_MODEL)
     except Exception as e:
-        logger.exception("Ranking invocation failed: %s", e)
-        raise
+        # Attempt fallback: call LLM WITHOUT structured output, then parse manually
+        logger.warning("Structured ranking failed (%s), attempting fallback parse...", e)
+        try:
+            start_time_fallback = time.time()
+            fallback_llm = ChatOllama(
+                base_url=OLLAMA_BASE_URL,
+                model=OLLAMA_MODEL,
+                temperature=0.2,
+                timeout=60,  # Shorter fallback timeout — best-effort recovery
+            )
+            fallback_chain = prompt | fallback_llm
+            raw_response = fallback_chain.invoke(
+                {
+                    "job_description": job_description_raw.strip(),
+                    "skills": ", ".join(s for s in profile.skills if s.strip()) or "None listed",
+                    "years_of_experience": profile.years_of_experience,
+                    "past_titles": ", ".join(profile.past_titles)
+                    if profile.past_titles
+                    else "None listed",
+                    "resume_text": profile.raw_resume_text or "Not available",
+                }
+            )
+            raw_text = (
+                raw_response.content if hasattr(raw_response, "content") else str(raw_response)
+            )
+            parsed = _extract_json_from_llm_output(raw_text)
+            result = RankingResult(**parsed)
+            elapsed = time.time() - start_time_fallback
+            logger.info("Fallback ranking succeeded in %.1fs", elapsed)
+        except Exception as fallback_error:
+            logger.exception("Both structured and fallback ranking failed: %s", fallback_error)
+            raise fallback_error from e  # Chain exceptions for debugging
 
     if not isinstance(result, RankingResult):
         raise ValueError(f"Expected RankingResult, got {type(result)}")
