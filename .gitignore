@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment variables
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Ruff cache
+.ruff_cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Evaluation outputs (keep directory, ignore results)
+# data/evaluations/*.json
+
+# Logs
+*.log

@@ -1,0 +1,46 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "candidate-ranking-agent"
+version = "0.1.0"
+description = "Local-first AI-powered candidate ranking system using Ollama"
+requires-python = ">= 3.10"
+dependencies = [
+    "langchain-ollama",
+    "langchain-core",
+    "pydantic>=2.0",
+    "python-dotenv",
+    "tenacity",
+    "deepeval",
+    "pandas",
+    "numpy",
+    "matplotlib",
+    "seaborn",
+    "pyarrow",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ipykernel",
+    "jupyter",
+    "mypy",
+    "ruff",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = false
+warn_return_any = true
+warn_unused_configs = true
